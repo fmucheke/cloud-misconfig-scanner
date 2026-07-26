@@ -250,13 +250,52 @@ def detect_unencrypted_ebs_volumes():
 
     return findings
 
-if __name__ == "__main__":
-    import json
+def detect_missing_mfa():
+    """
+    Checks the root account and every IAM user with console access for
+    missing multi-factor authentication (MFA).
 
-    all_findings = []
-    all_findings.extend(detect_public_s3_buckets())
-    all_findings.extend(detect_open_security_groups())
-    all_findings.extend(detect_iam_wildcard_policies())
-    all_findings.extend(detect_unencrypted_ebs_volumes())
+    IAM users with only programmatic (access key) access are skipped —
+    MFA protects human console login events, so a user with no console
+    login profile isn't a valid target for this check.
 
-    print(json.dumps(all_findings, indent=2))
+    Maps to CIS AWS Foundations Benchmark 1.5 (root MFA) and 1.10
+    (IAM users with console access should have MFA), and NIST CSF PR.AC-7.
+    """
+    iam = boto3.client('iam')
+    findings = []
+
+    # Step 1: check root account MFA status
+    account_summary = iam.get_account_summary()['SummaryMap']
+    if account_summary.get('AccountMFAEnabled', 0) == 0:
+        findings.append({
+            "resource_type": "Root Account",
+            "resource_name": "root",
+            "issue": "Root account does not have MFA enabled",
+            "details": ["The AWS account root user has no MFA device registered — the single highest-priority finding possible, since root access is unrestricted."]
+        })
+
+    # Step 2: check every IAM user with console access for MFA
+    paginator = iam.get_paginator('list_users')
+    for page in paginator.paginate():
+        for user in page['Users']:
+            user_name = user['UserName']
+
+            # Step 3: skip users with no console login profile —
+            # MFA doesn't apply to programmatic-only (access key) users
+            try:
+                iam.get_login_profile(UserName=user_name)
+            except iam.exceptions.NoSuchEntityException:
+                continue  # no console access — not a valid target for this check
+
+            # Step 4: user has console access, so check for an MFA device
+            mfa_devices = iam.list_mfa_devices(UserName=user_name)['MFADevices']
+            if not mfa_devices:
+                findings.append({
+                    "resource_type": "IAM User",
+                    "resource_name": user_name,
+                    "issue": "IAM user has console access but no MFA device registered",
+                    "details": [f"User '{user_name}' can log into the AWS console with just a password, with no second factor required."]
+                })
+
+    return findings
