@@ -8,7 +8,6 @@ def detect_public_s3_buckets():
     s3 = boto3.client('s3')
     findings = []
 
-    # Step 1: get every bucket in the account
     response = s3.list_buckets()
     buckets = response['Buckets']
 
@@ -17,36 +16,31 @@ def detect_public_s3_buckets():
         is_public = False
         reason = []
 
-        # Step 2: check the Block Public Access settings for this specific bucket
         try:
             public_access_block = s3.get_public_access_block(Bucket=bucket_name)
             config = public_access_block['PublicAccessBlockConfiguration']
-            # If any of these are False, public access isn't fully blocked
             if not all(config.values()):
                 is_public = True
                 reason.append("Block Public Access exists but is not fully enabled (one or more settings are off)")
         except s3.exceptions.ClientError as e:
             error_code = e.response['Error']['Code']
             if error_code == 'NoSuchPublicAccessBlockConfiguration':
-                # This specific error means no config was ever set at all
                 is_public = True
                 reason.append("No Block Public Access configuration exists for this bucket")
             else:
-                # Some other unexpected error occurred — don't silently treat as a finding
                 reason.append(f"Could not check Block Public Access settings: {error_code}")
 
-        # Step 3: check the bucket policy for a public "Principal": "*" statement
         try:
             policy_status = s3.get_bucket_policy_status(Bucket=bucket_name)
             if policy_status['PolicyStatus']['IsPublic']:
                 is_public = True
                 reason.append("Bucket policy allows public access")
         except s3.exceptions.ClientError:
-            # No bucket policy exists at all — not itself a finding
             pass
 
         if is_public:
             findings.append({
+                "finding_type": "s3_public_bucket",
                 "resource_type": "S3 Bucket",
                 "resource_name": bucket_name,
                 "issue": "Publicly accessible bucket",
@@ -64,7 +58,6 @@ def detect_open_security_groups():
     ec2 = boto3.client('ec2')
     findings = []
 
-    # Ports considered sensitive enough to flag if open to the world
     SENSITIVE_PORTS = {
         22: "SSH",
         3389: "RDP",
@@ -73,7 +66,6 @@ def detect_open_security_groups():
         27017: "MongoDB"
     }
 
-    # Step 1: get every security group in the account
     response = ec2.describe_security_groups()
     security_groups = response['SecurityGroups']
 
@@ -82,15 +74,12 @@ def detect_open_security_groups():
         sg_name = sg.get('GroupName', 'N/A')
         open_rules = []
 
-        # Step 2: check each inbound rule
         for permission in sg['IpPermissions']:
             from_port = permission.get('FromPort')
             to_port = permission.get('ToPort')
 
-            # Step 3: check if this rule allows traffic from anywhere (0.0.0.0/0)
             for ip_range in permission.get('IpRanges', []):
                 if ip_range.get('CidrIp') == '0.0.0.0/0':
-                    # Step 4: check if the open port range includes a sensitive port
                     if from_port is not None and to_port is not None:
                         for port, service_name in SENSITIVE_PORTS.items():
                             if from_port <= port <= to_port:
@@ -102,6 +91,7 @@ def detect_open_security_groups():
 
         if open_rules:
             findings.append({
+                "finding_type": "open_security_group",
                 "resource_type": "Security Group",
                 "resource_name": sg_name,
                 "resource_id": sg_id,
@@ -117,14 +107,11 @@ def detect_iam_wildcard_policies():
     groups, and roles) for statements that grant overly broad access via
     wildcards in Action and/or Resource.
     Returns a list of findings for any policy statement with this exposure.
-
-    Maps to CIS AWS Foundations Benchmark 1.22 and NIST CSF PR.AC-4.
     """
     iam = boto3.client('iam')
     findings = []
 
     def as_list(value):
-        # IAM policy fields can be a single string or a list — normalize to list
         if value is None:
             return []
         return value if isinstance(value, list) else [value]
@@ -144,33 +131,40 @@ def detect_iam_wildcard_policies():
 
             issue = None
             reason = []
+            severity_hint = None
 
             if action_is_wildcard and resource_is_wildcard:
                 issue = "IAM policy grants unrestricted admin access (Action:* on Resource:*)"
                 reason.append("Statement allows every action on every resource")
+                severity_hint = "full_admin"
             elif action_is_wildcard:
                 issue = "IAM policy grants all actions on a scoped resource"
                 reason.append("Statement allows Action:* even though Resource is scoped")
+                severity_hint = "action_wildcard_scoped_resource"
             elif partial_wildcard_actions and resource_is_wildcard:
                 issue = "IAM policy grants a service-level wildcard action on all resources"
                 reason.append(f"Statement allows {partial_wildcard_actions} on Resource:*")
+                severity_hint = "service_wildcard_all_resources"
             elif not_actions and resource_is_wildcard:
                 issue = "IAM policy uses NotAction with Resource:*"
                 reason.append("Statement implicitly allows all actions except those listed, on every resource")
+                severity_hint = "notaction_resource_wildcard"
             elif partial_wildcard_actions:
                 issue = "IAM policy uses a partial wildcard action"
                 reason.append(f"Statement allows {partial_wildcard_actions} even though resources are scoped")
+                severity_hint = "partial_wildcard_scoped"
 
             if issue:
                 findings.append({
+                    "finding_type": "iam_wildcard_policy",
                     "resource_type": resource_type,
                     "resource_name": resource_name,
                     "attached_to": attached_to,
                     "issue": issue,
-                    "details": reason
+                    "details": reason,
+                    "severity_hint": severity_hint
                 })
 
-    # Step 1: check customer-managed policies (Scope='Local' excludes AWS-managed ones)
     paginator = iam.get_paginator('list_policies')
     for page in paginator.paginate(Scope='Local', OnlyAttached=True):
         for policy in page['Policies']:
@@ -181,7 +175,6 @@ def detect_iam_wildcard_policies():
             document = version['PolicyVersion']['Document']
             statements = as_list(document.get('Statement'))
 
-            # Step 2: find what this policy is attached to
             entities = iam.list_entities_for_policy(PolicyArn=policy_arn)
             attached_to = (
                 [u['UserName'] for u in entities.get('PolicyUsers', [])] +
@@ -191,7 +184,6 @@ def detect_iam_wildcard_policies():
 
             check_statements(statements, "IAM Managed Policy", policy_name, attached_to)
 
-    # Step 3: check inline policies on roles (most common place to find these in sandbox/test setups)
     role_paginator = iam.get_paginator('list_roles')
     for page in role_paginator.paginate():
         for role in page['Roles']:
@@ -209,24 +201,19 @@ def detect_unencrypted_ebs_volumes():
     """
     Checks every EBS volume in the current region for missing encryption at rest.
     Returns a list of findings for any volume that is not encrypted.
-
-    Maps to CIS AWS Foundations Benchmark 2.2.1 and NIST CSF PR.DS-1.
     """
     ec2 = boto3.client('ec2')
     findings = []
 
-    # Step 1: get every volume in the current region
     response = ec2.describe_volumes()
     volumes = response['Volumes']
 
     for volume in volumes:
-        # Step 2: skip volumes that are already encrypted — not a finding
         if volume.get('Encrypted', False):
             continue
 
         volume_id = volume['VolumeId']
 
-        # Step 3: pull the Name tag if one exists, otherwise fall back to the volume ID
         name_tag = volume_id
         for tag in volume.get('Tags', []):
             if tag.get('Key') == 'Name':
@@ -241,11 +228,13 @@ def detect_unencrypted_ebs_volumes():
             details.append("Currently unattached")
 
         findings.append({
+            "finding_type": "unencrypted_ebs_volume",
             "resource_type": "EBS Volume",
             "resource_name": name_tag,
             "resource_id": volume_id,
             "issue": "Unencrypted EBS volume",
-            "details": details
+            "details": details,
+            "attached_instances": attached_instances
         })
 
     return findings
@@ -258,40 +247,34 @@ def detect_missing_mfa():
     IAM users with only programmatic (access key) access are skipped —
     MFA protects human console login events, so a user with no console
     login profile isn't a valid target for this check.
-
-    Maps to CIS AWS Foundations Benchmark 1.5 (root MFA) and 1.10
-    (IAM users with console access should have MFA), and NIST CSF PR.AC-7.
     """
     iam = boto3.client('iam')
     findings = []
 
-    # Step 1: check root account MFA status
     account_summary = iam.get_account_summary()['SummaryMap']
     if account_summary.get('AccountMFAEnabled', 0) == 0:
         findings.append({
+            "finding_type": "missing_mfa_root",
             "resource_type": "Root Account",
             "resource_name": "root",
             "issue": "Root account does not have MFA enabled",
             "details": ["The AWS account root user has no MFA device registered — the single highest-priority finding possible, since root access is unrestricted."]
         })
 
-    # Step 2: check every IAM user with console access for MFA
     paginator = iam.get_paginator('list_users')
     for page in paginator.paginate():
         for user in page['Users']:
             user_name = user['UserName']
 
-            # Step 3: skip users with no console login profile —
-            # MFA doesn't apply to programmatic-only (access key) users
             try:
                 iam.get_login_profile(UserName=user_name)
             except iam.exceptions.NoSuchEntityException:
-                continue  # no console access — not a valid target for this check
+                continue
 
-            # Step 4: user has console access, so check for an MFA device
             mfa_devices = iam.list_mfa_devices(UserName=user_name)['MFADevices']
             if not mfa_devices:
                 findings.append({
+                    "finding_type": "missing_mfa_console_user",
                     "resource_type": "IAM User",
                     "resource_name": user_name,
                     "issue": "IAM user has console access but no MFA device registered",
