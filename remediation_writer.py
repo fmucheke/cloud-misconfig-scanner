@@ -85,27 +85,100 @@ def generate_remediation(finding):
     return response.content[0].text
 
 
+EXEC_SUMMARY_SYSTEM_PROMPT = """You are a cloud security consultant writing the executive summary section of a client report. Your audience is non-technical decision-makers (executives, board members) who will not read the detailed findings — this summary may be the ONLY part of the report they read. Write 3-4 sentences that:
+
+1. State the overall risk posture in plain business terms (not a jargon-heavy technical assessment).
+2. Reference the actual counts and severities provided to you — do not estimate, round loosely, or characterize the scale differently than the numbers given.
+3. Name the single most urgent issue category by its plain-English description (not its finding_type code or control ID) if a CRITICAL finding exists.
+4. End with a clear statement of what should happen next (e.g. "immediate remediation of the critical finding is recommended before addressing lower-priority items").
+
+Strict rules:
+- Use ONLY the counts, severities, and finding descriptions provided to you. Do not invent additional findings, statistics, or claims about the environment beyond what's given.
+- Do not use headers, bullet points, or markdown. 3-4 sentences of plain prose only.
+- Do not mention internal implementation details (finding_type, control mapping codes, JSON field names) — this is a business summary, not a technical citation.
+- Do not undersell or oversell the risk relative to the actual severity counts given — if there is one CRITICAL and four lower-severity findings, reflect that balance accurately rather than treating the whole report as uniformly alarming or uniformly minor.
+- Never state a count of "severity levels" or any other meta-statistic you were not explicitly given. The only severity categories that exist are CRITICAL, HIGH, and MEDIUM — do not imply a different number of categories exists than the ones actually present in the breakdown you were given. State the specific numbers (e.g. "1 critical, 3 high, and 1 medium finding") rather than describing the shape of the data in your own words."""
+
+
+def build_summary_input(enriched_findings):
+    """
+    Computes aggregate statistics from the findings list — counts by
+    severity, and a plain-English description of each finding — rather
+    than asking the LLM to count or characterize the findings itself.
+    The LLM only turns these pre-computed facts into prose.
+    """
+    severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "UNKNOWN": 0}
+    for f in enriched_findings:
+        severity_counts[f.get("severity", "UNKNOWN")] += 1
+
+    finding_lines = []
+    for f in enriched_findings:
+        finding_lines.append(f"- [{f.get('severity')}] {f.get('resource_type')} '{f.get('resource_name')}': {f.get('issue')}")
+
+    return f"""Total findings: {len(enriched_findings)}
+Severity breakdown: {severity_counts['CRITICAL']} CRITICAL, {severity_counts['HIGH']} HIGH, {severity_counts['MEDIUM']} MEDIUM
+
+Findings:
+{chr(10).join(finding_lines)}
+
+Write the executive summary now."""
+
+
+def generate_executive_summary(enriched_findings):
+    """
+    Takes the full list of enriched findings from one scan and returns a
+    short executive summary paragraph (plain string).
+    """
+    user_message = build_summary_input(enriched_findings)
+
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=250,
+        temperature=0.3,
+        system=EXEC_SUMMARY_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_message}]
+    )
+
+    return response.content[0].text
+
+
 if __name__ == "__main__":
-    # S10 scope: test against exactly one finding type before extending
-    # to all five in S11. Loads a real enriched finding from findings.json
-    # (produced by a live python scan.py run) rather than a hand-typed
-    # sample, so this test reflects actual pipeline output.
+    # extend from the single IAM wildcard test in S10 to all 5 finding
+    # types, checking for consistent quality/tone/citation accuracy across
+    # the board — not just that the code runs, but that the output holds up.
     import json
 
     with open("findings.json") as f:
         scan_output = json.load(f)
 
-    # Pick the IAM wildcard policy finding specifically for this first test —
-    # it's the most severity-varied finding type, a good stress test for
-    # whether the prompt correctly reflects CRITICAL urgency.
-    test_finding = next(
-        (f for f in scan_output["findings"] if f["finding_type"] == "iam_wildcard_policy"),
-        None
-    )
+    # One representative finding per type. Some finding_types only ever
+    # produce one severity in this sandbox (S3, security groups, MFA);
+    # iam_wildcard_policy and unencrypted_ebs_volume vary, but we already
+    # example of each distinct finding_type present in the current scan.
+    seen_types = set()
+    test_findings = []
+    for finding in scan_output["findings"]:
+        if finding["finding_type"] not in seen_types:
+            test_findings.append(finding)
+            seen_types.add(finding["finding_type"])
 
-    if test_finding is None:
-        print("No iam_wildcard_policy finding in findings.json — run scan.py against the sandbox first.")
+    if not test_findings:
+        print("No findings in findings.json — run scan.py against the sandbox first.")
     else:
-        print(f"Generating remediation for: {test_finding['resource_name']} (severity: {test_finding['severity']})\n")
-        paragraph = generate_remediation(test_finding)
-        print(paragraph)
+        for finding in test_findings:
+            print("=" * 70)
+            print(f"{finding['finding_type']} — {finding['resource_name']} (severity: {finding['severity']})")
+            print("=" * 70)
+            paragraph = generate_remediation(finding)
+            print(paragraph)
+            print()
+
+        # generate one executive summary across ALL findings from this
+        # scan (not just the one-per-type sample used above for the
+        # per-finding test) — the summary should reflect the real,
+        # complete severity breakdown from the actual scan.
+        print("=" * 70)
+        print("EXECUTIVE SUMMARY")
+        print("=" * 70)
+        summary = generate_executive_summary(scan_output["findings"])
+        print(summary)
