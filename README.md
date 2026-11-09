@@ -8,8 +8,8 @@ A cloud security tool that scans an AWS account for common misconfigurations, ma
 ## Setup
 1. Create a Python virtual environment: `python -m venv venv`
 2. Activate it and install dependencies: `pip install boto3 anthropic python-dotenv markdown2 xhtml2pdf`
-3. Configure AWS credentials for a least-privilege IAM user (see `/policies` for the exact custom policy used — deliberately scoped to read-only actions, not the AWS-managed ReadOnlyAccess policy)
-4. Create a `.env` file in the project root with `ANTHROPIC_API_KEY=your-key-here` (get a key at console.anthropic.com — never commit this file; it's already excluded in `.gitignore`)
+3. Configure AWS credentials for a least-privilege IAM user (see `/policies` for the exact custom policy used, deliberately scoped to read-only actions, not the AWS-managed ReadOnlyAccess policy)
+4. Create a `.env` file in the project root with `ANTHROPIC_API_KEY=your-key-here` (get a key at console.anthropic.com)
 5. Run the full pipeline (see Usage below)
 
 ## Usage
